@@ -365,6 +365,8 @@ class NCloudMusicProvider(MusicProvider):
             ProviderFeature.SEARCH,
             ProviderFeature.BROWSE,
             ProviderFeature.LIBRARY_PLAYLISTS,
+            ProviderFeature.ARTIST_ALBUMS,
+            ProviderFeature.ARTIST_TOPTRACKS,
         }
     
     async def handle_async_init(self) -> None:
@@ -745,7 +747,7 @@ class NCloudMusicProvider(MusicProvider):
             return self._parse_playlist(data["playlist"])
         raise ValueError(f"歌单不存在: {prov_playlist_id}")
     
-    async def get_artist_top_tracks(self, prov_artist_id: str) -> list[Track]:
+    async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
         """获取歌手热门 50 首歌曲。"""
         data = await self._api_request(f"/artist/top/song?id={prov_artist_id}")
         if data.get("code") != 200:
