@@ -12,7 +12,11 @@ from collections.abc import AsyncGenerator
 
 import aiohttp
 
-from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
+from music_assistant_models.config_entries import (
+    ConfigEntry,
+    ConfigValueType,
+    ConfigValueOption,
+)
 from music_assistant_models.enums import (
     ConfigEntryType,
     ContentType,
@@ -47,6 +51,7 @@ __version__ = "0.1.0"
 CONF_API_URL = "api_url"
 CONF_COOKIE = "cookie"
 CONF_ACTION_QR_LOGIN = "qr_login"
+CONF_AUDIO_QUALITY = "audio_quality"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -98,9 +103,27 @@ async def get_config_entries(
             key=CONF_API_URL,
             type=ConfigEntryType.STRING,
             label="API 服务器地址",
-            description="第三方 API 服务的完整 URL（例如：http://192.168.1.100:4001）",
+            description="第三方 API 服务的完整 URL（例如：http://192.168.1.100:3000）",
             required=True,
             default_value="",
+        ),
+        ConfigEntry(
+            key=CONF_AUDIO_QUALITY,
+            type=ConfigEntryType.STRING,
+            label="期望音质",
+            default_value="exhigh",
+            options=(
+                ConfigValueOption(title="标准 (128k) ⚪", value="standard"),
+                ConfigValueOption(title="较高 (192k) ⚪", value="higher"),
+                ConfigValueOption(title="极高 (320k) ⚪", value="exhigh"),
+                ConfigValueOption(title="无损 (FLAC) 🔴", value="lossless"),
+                ConfigValueOption(title="Hi-Res 🔴", value="hires"),
+                ConfigValueOption(title="高清环绕声 👑", value="jyeffect"),
+                ConfigValueOption(title="沉浸环绕声 👑", value="sky"),
+                ConfigValueOption(title="杜比全景声 👑", value="dolby"),
+                ConfigValueOption(title="超清母带 👑", value="jymaster"),
+            ),
+            description="播放时尝试的最高音质。如果所选音质不可用，将自动尝试更低音质。",
         ),
         ConfigEntry(
             key=CONF_COOKIE,
@@ -690,7 +713,20 @@ class NCloudMusicProvider(MusicProvider):
         2. 如果是试听片段或无 URL，尝试解灰 (source=pyncmd,bodian,kuwo)
         """
         # 1. 尝试官方源
-        levels = ["exhigh", "standard", "higher", "jymaster"]
+        quality_config = self.config.get_value(CONF_AUDIO_QUALITY)
+        # 音质从高到低排序
+        all_levels = [
+            "jymaster", "dolby", "sky", "jyeffect", 
+            "hires", "lossless", "exhigh", "higher", "standard"
+        ]
+        try:
+            start_index = all_levels.index(quality_config)
+            levels = all_levels[start_index:]
+        except ValueError:
+            # 默认或无效值处理，默认从 exhigh 开始
+            levels = ["exhigh", "higher", "standard"]
+            
+        _LOGGER.debug("尝试音质列表 (config=%s): %s", quality_config, levels)
         
         song_data = None
         url = None
