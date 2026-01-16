@@ -68,15 +68,24 @@ async def get_config_entries(
     """
     返回此 Provider 的配置项定义。
     
-    当用户点击 ACTION 按钮时，action 参数会传入对应的 key。
+    参考 Spotify 的实现：在 ACTION 处理中直接 await 等待认证完成。
     """
-    # 处理扫码登录 ACTION
-    if action == CONF_ACTION_QR_LOGIN:
-        await _handle_qr_login(mass, instance_id, values)
+    # 处理扫码登录 ACTION（参考 Spotify 的 _handle_auth_actions）
+    if action == CONF_ACTION_QR_LOGIN and values:
+        # 调用登录流程并等待（就像 Spotify 的 pkce_auth_flow）
+        cookie = await _qr_code_login_flow(mass, values)
+        if cookie:
+            # 直接修改 values 字典（Spotify 的标准做法）
+            values[CONF_COOKIE] = cookie
+            _LOGGER.info("✅ 扫码登录成功！Cookie 已获取，MA 会在保存时持久化。")
+        else:
+            _LOGGER.warning("⚠️ 扫码登录失败或超时")
     
-    # 判断登录状态
+    # 判断登录状态（加密字段非空表示已设置）
     cookie = values.get(CONF_COOKIE, "") if values else ""
-    if cookie:
+    has_cookie = cookie not in (None, "")
+    
+    if has_cookie:
         login_label = "✅ 已登录"
         login_desc = "如需更换账号，请点击重新扫码登录。"
     else:
@@ -117,6 +126,117 @@ async def get_config_entries(
             required=False,
         ),
     )
+
+
+async def _qr_code_login_flow(
+    mass: MusicAssistant,
+    values: dict[str, ConfigValueType],
+) -> str | None:
+    """
+    二维码登录流程（模仿 Spotify 的 pkce_auth_flow）。
+    
+    这个函数会 await 等待登录完成或超时，但不会阻塞 UI。
+    返回 Cookie 字符串，失败返回 None。
+    """
+    api_url = str(values.get(CONF_API_URL, "")).rstrip("/")
+    session_id = values.get("session_id")
+    
+    if not api_url:
+        _LOGGER.error("扫码登录失败：未配置 API 地址")
+        return None
+    
+    if not session_id:
+        _LOGGER.error("扫码登录失败：缺少 session_id")
+        return None
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 步骤 1: 获取二维码 key
+            _LOGGER.info("[1/4] 获取二维码 key...")
+            async with session.get(f"{api_url}/login/qr/key?timestamp={_timestamp()}") as resp:
+                key_data = await resp.json()
+                if key_data.get("code") != 200:
+                    _LOGGER.error("获取二维码 key 失败: %s", key_data)
+                    return None
+                qr_key = key_data["data"]["unikey"]
+                _LOGGER.debug("获取到 key: %s", qr_key)
+            
+            # 步骤 2: 生成二维码 URL
+            _LOGGER.info("[2/4] 生成二维码 URL...")
+            async with session.get(
+                f"{api_url}/login/qr/create?key={qr_key}&qrimg=true&timestamp={_timestamp()}"
+            ) as resp:
+                qr_data = await resp.json()
+                if qr_data.get("code") != 200:
+                    _LOGGER.error("生成二维码失败: %s", qr_data)
+                    return None
+                qr_url = qr_data["data"].get("qrurl")
+        
+        if not qr_url:
+            _LOGGER.error("二维码 URL 为空")
+            return None
+        
+        # 步骤 3: 使用 AuthenticationHelper 打开浏览器
+        from urllib.parse import quote
+        from music_assistant.helpers.auth import AuthenticationHelper
+        
+        qr_image_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={quote(qr_url)}"
+        
+        _LOGGER.info("[3/4] 打开浏览器显示二维码...")
+        _LOGGER.info("二维码链接: %s", qr_image_url)
+        
+        # 打开浏览器（不需要等待回调，因为扫码在手机上）
+        try:
+            async with AuthenticationHelper(mass, str(session_id)) as auth_helper:
+                # 启动认证流程但不等待回调
+                asyncio.create_task(auth_helper.authenticate(qr_image_url))
+                await asyncio.sleep(0.5)  # 短暂等待浏览器打开
+        except Exception as e:
+            _LOGGER.warning("打开浏览器失败: %s", e)
+        
+        # 步骤 4: 轮询登录状态（等待用户扫码）
+        _LOGGER.info("[4/4] 等待扫码（最多 120 秒）...")
+        _LOGGER.info("提示：请使用云音乐 APP 扫描二维码")
+        
+        async with aiohttp.ClientSession() as session:
+            for i in range(60):  # 最多轮询 120 秒（60 次 x 2 秒）
+                await asyncio.sleep(2)  # 每 2 秒轮询一次
+                
+                try:
+                    async with session.get(
+                        f"{api_url}/login/qr/check?key={qr_key}&timestamp={_timestamp()}"
+                    ) as resp:
+                        check_data = await resp.json()
+                        code = check_data.get("code")
+                        
+                        if code == 803:  # 登录成功
+                            cookie = check_data.get("cookie", "")
+                            if cookie:
+                                _LOGGER.info("🎉 扫码登录成功！Cookie 长度: %d", len(cookie))
+                                return cookie
+                            else:
+                                _LOGGER.error("登录成功但 Cookie 为空")
+                                return None
+                        
+                        elif code == 800:  # 二维码过期
+                            _LOGGER.warning("二维码已过期，请重新扫码")
+                            return None
+                        
+                        elif code == 802:  # 等待用户确认
+                            _LOGGER.info("已扫码，等待您在手机上确认...")
+                        
+                        # code == 801: 等待扫码（继续轮询）
+                        
+                except Exception as e:
+                    _LOGGER.warning("轮询登录状态异常: %s", e)
+            
+            # 超时
+            _LOGGER.warning("扫码登录超时（120 秒），请重新尝试")
+            return None
+    
+    except Exception as e:
+        _LOGGER.exception("扫码登录流程异常: %s", e)
+        return None
 
 
 async def _handle_qr_login(
@@ -371,17 +491,6 @@ class NCloudMusicProvider(MusicProvider):
             name=al.get("name", "未知专辑"),
         )
         
-        # 封面图片
-        images = []
-        if pic_url := al.get("picUrl"):
-            images.append(
-                MediaItemImage(
-                    type=ImageType.THUMB,
-                    path=f"{pic_url}?param=300y300",
-                    provider=self.instance_id,
-                )
-            )
-        
         return Track(
             item_id=track_id,
             provider=self.instance_id,
@@ -397,7 +506,6 @@ class NCloudMusicProvider(MusicProvider):
             album=album,
             duration=data.get("dt", 0) // 1000,  # 毫秒转秒
             metadata={},
-            images=images,
         )
     
     def _parse_album(self, data: dict) -> Album:
