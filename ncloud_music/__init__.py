@@ -646,11 +646,68 @@ class NCloudMusicProvider(MusicProvider):
     
     # ========== 获取详情 ==========
     
+    async def _get_real_audio_quality(self, item_id: str) -> AudioFormat:
+        """获取歌曲的真实音质信息。"""
+        quality_config = self.config.get_value(CONF_AUDIO_QUALITY)
+        # 默认值
+        content_type = ContentType.UNKNOWN
+        sample_rate = 44100
+        bit_depth = 16
+        bit_rate = 128000
+        
+        try:
+            # 调用 /song/url/v1 获取详细信息
+            # 注意：这里只尝试一次用户配置的音质，不进行复杂的降级/解灰逻辑
+            # 因为这只是为了显示元数据，如果播放时不可用，get_stream_details 会处理
+            data = await self._api_request(
+                "/song/url/v1",
+                {"id": item_id, "level": quality_config},
+            )
+            
+            if data.get("code") == 200 and data.get("data"):
+                song_data = data["data"][0]
+                
+                # 解析格式
+                file_type = str(song_data.get("type", "")).lower()
+                br = song_data.get("br", 0)
+                sr = song_data.get("sr", 0)
+                
+                if file_type == "mp3":
+                    content_type = ContentType.MP3
+                elif file_type == "flac":
+                    content_type = ContentType.FLAC
+                    # 简单的位深度推断
+                    if br > 1000000:
+                        bit_depth = 24
+                elif file_type == "m4a":
+                    content_type = ContentType.AAC
+                
+                if br:
+                    bit_rate = br
+                if sr:
+                    sample_rate = sr
+                    
+        except Exception as e:
+            _LOGGER.warning("获取真实音质失败: %s", e)
+            
+        return AudioFormat(
+            content_type=content_type,
+            sample_rate=sample_rate,
+            bit_depth=bit_depth,
+            bit_rate=bit_rate // 1000 if bit_rate else None, # kbps
+        )
+
     async def get_track(self, prov_track_id: str) -> Track:
         """获取单曲详情。"""
         data = await self._api_request("/song/detail", {"ids": prov_track_id})
         if data.get("code") == 200 and data.get("songs"):
-            return self._parse_track(data["songs"][0])
+            track = self._parse_track(data["songs"][0])
+            # 获取并更新真实音质
+            if track.provider_mappings:
+                audio_format = await self._get_real_audio_quality(prov_track_id)
+                for mapping in track.provider_mappings:
+                    mapping.audio_format = audio_format
+            return track
         raise ValueError(f"歌曲不存在: {prov_track_id}")
     
     async def get_album(self, prov_album_id: str) -> Album:
