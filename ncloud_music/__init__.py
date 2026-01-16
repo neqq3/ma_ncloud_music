@@ -470,28 +470,7 @@ class NCloudMusicProvider(MusicProvider):
         """解析 API 返回的歌曲数据为 Track 对象。"""
         track_id = str(data["id"])
         
-        # 解析艺术家
-        artists = []
-        for ar in data.get("ar", []):
-            artists.append(
-                ItemMapping(
-                    media_type=MediaType.ARTIST,
-                    item_id=str(ar["id"]),
-                    provider=self.instance_id,
-                    name=ar.get("name", "未知艺术家"),
-                )
-            )
-        
-        # 解析专辑
-        al = data.get("al", {})
-        album = ItemMapping(
-            media_type=MediaType.ALBUM,
-            item_id=str(al.get("id", 0)),
-            provider=self.instance_id,
-            name=al.get("name", "未知专辑"),
-        )
-        
-        return Track(
+        track = Track(
             item_id=track_id,
             provider=self.instance_id,
             name=data.get("name", "未知歌曲"),
@@ -502,20 +481,14 @@ class NCloudMusicProvider(MusicProvider):
                     provider_instance=self.instance_id,
                 )
             },
-            artists=artists,
-            album=album,
-            duration=data.get("dt", 0) // 1000,  # 毫秒转秒
-            metadata={},
         )
-    
-    def _parse_album(self, data: dict) -> Album:
-        """解析 API 返回的专辑数据为 Album 对象。"""
-        album_id = str(data["id"])
+        
+        # 后置设置属性
+        track.duration = data.get("dt", 0) // 1000
         
         # 解析艺术家
-        artists = []
-        for ar in data.get("artists", []):
-            artists.append(
+        for ar in data.get("ar", []):
+            track.artists.append(
                 ItemMapping(
                     media_type=MediaType.ARTIST,
                     item_id=str(ar["id"]),
@@ -524,18 +497,32 @@ class NCloudMusicProvider(MusicProvider):
                 )
             )
         
-        # 封面图片
-        images = []
-        if pic_url := data.get("picUrl"):
-            images.append(
-                MediaItemImage(
-                    type=ImageType.THUMB,
-                    path=f"{pic_url}?param=300y300",
-                    provider=self.instance_id,
-                )
+        # 解析专辑
+        al = data.get("al", {})
+        if al:
+            track.album = ItemMapping(
+                media_type=MediaType.ALBUM,
+                item_id=str(al.get("id", 0)),
+                provider=self.instance_id,
+                name=al.get("name", "未知专辑"),
             )
+            # 使用专辑封面作为歌曲封面
+            if pic_url := al.get("picUrl"):
+                track.metadata.images = [
+                    MediaItemImage(
+                        type=ImageType.THUMB,
+                        path=f"{pic_url}?param=300y300",
+                        provider=self.instance_id,
+                    )
+                ]
         
-        return Album(
+        return track
+    
+    def _parse_album(self, data: dict) -> Album:
+        """解析 API 返回的专辑数据为 Album 对象。"""
+        album_id = str(data["id"])
+        
+        album = Album(
             item_id=album_id,
             provider=self.instance_id,
             name=data.get("name", "未知专辑"),
@@ -546,26 +533,36 @@ class NCloudMusicProvider(MusicProvider):
                     provider_instance=self.instance_id,
                 )
             },
-            artists=artists,
-            images=images,
         )
-    
-    def _parse_artist(self, data: dict) -> Artist:
-        """解析 API 返回的歌手数据为 Artist 对象。"""
-        artist_id = str(data["id"])
+        
+        # 解析艺术家
+        for ar in data.get("artists", []):
+            album.artists.append(
+                ItemMapping(
+                    media_type=MediaType.ARTIST,
+                    item_id=str(ar["id"]),
+                    provider=self.instance_id,
+                    name=ar.get("name", "未知艺术家"),
+                )
+            )
         
         # 封面图片
-        images = []
-        if pic_url := data.get("picUrl") or data.get("img1v1Url"):
-            images.append(
+        if pic_url := data.get("picUrl"):
+            album.metadata.images = [
                 MediaItemImage(
                     type=ImageType.THUMB,
                     path=f"{pic_url}?param=300y300",
                     provider=self.instance_id,
                 )
-            )
+            ]
         
-        return Artist(
+        return album
+    
+    def _parse_artist(self, data: dict) -> Artist:
+        """解析 API 返回的歌手数据为 Artist 对象。"""
+        artist_id = str(data["id"])
+        
+        artist = Artist(
             item_id=artist_id,
             provider=self.instance_id,
             name=data.get("name", "未知艺术家"),
@@ -576,30 +573,25 @@ class NCloudMusicProvider(MusicProvider):
                     provider_instance=self.instance_id,
                 )
             },
-            images=images,
         )
-    
-    def _parse_playlist(self, data: dict) -> Playlist:
-        """解析 API 返回的歌单数据为 Playlist 对象。"""
-        playlist_id = str(data["id"])
         
         # 封面图片
-        images = []
-        if pic_url := data.get("coverImgUrl"):
-            images.append(
+        if pic_url := data.get("picUrl") or data.get("img1v1Url"):
+            artist.metadata.images = [
                 MediaItemImage(
                     type=ImageType.THUMB,
                     path=f"{pic_url}?param=300y300",
                     provider=self.instance_id,
                 )
-            )
+            ]
         
-        # 创建者
-        owner = ""
-        if creator := data.get("creator"):
-            owner = creator.get("nickname", "")
+        return artist
+    
+    def _parse_playlist(self, data: dict) -> Playlist:
+        """解析 API 返回的歌单数据为 Playlist 对象。"""
+        playlist_id = str(data["id"])
         
-        return Playlist(
+        playlist = Playlist(
             item_id=playlist_id,
             provider=self.instance_id,
             name=data.get("name", "未知歌单"),
@@ -610,9 +602,23 @@ class NCloudMusicProvider(MusicProvider):
                     provider_instance=self.instance_id,
                 )
             },
-            owner=owner,
-            images=images,
         )
+        
+        # 创建者
+        if creator := data.get("creator"):
+            playlist.owner = creator.get("nickname", "")
+        
+        # 封面图片
+        if pic_url := data.get("coverImgUrl"):
+            playlist.metadata.images = [
+                MediaItemImage(
+                    type=ImageType.THUMB,
+                    path=f"{pic_url}?param=300y300",
+                    provider=self.instance_id,
+                )
+            ]
+        
+        return playlist
     
     # ========== 获取详情 ==========
     
