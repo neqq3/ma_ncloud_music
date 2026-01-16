@@ -1,0 +1,11 @@
+{
+  "type": "music",
+  "domain": "ncloud_music",
+  "name": "NCloud Music",
+  "description": "Music provider for NCloud Music (third-party API)",
+  "documentation": "https://github.com/neqq3/ma_ncloud_music",
+  "codeowners": ["@neqq3"],
+  "requirements": ["aiohttp>=3.8.0"],
+  "multi_instance": true,
+  "version": "0.1.0"
+}
