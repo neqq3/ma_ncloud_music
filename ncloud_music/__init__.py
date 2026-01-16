@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import TYPE_CHECKING
+from collections.abc import AsyncGenerator
 
 import aiohttp
 
@@ -643,6 +644,20 @@ class NCloudMusicProvider(MusicProvider):
             return self._parse_artist(data["artist"])
         raise ValueError(f"歌手不存在: {prov_artist_id}")
     
+    async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
+        """获取专辑中的所有歌曲。"""
+        data = await self._api_request(f"/album?id={prov_album_id}")
+        if data.get("code") == 200 and data.get("songs"):
+            return [self._parse_track(song) for song in data["songs"]]
+        return []
+    
+    async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
+        """获取歌手的专辑列表。"""
+        data = await self._api_request(f"/artist/album?id={prov_artist_id}&limit=50")
+        if data.get("code") == 200 and data.get("hotAlbums"):
+            return [self._parse_album(album) for album in data["hotAlbums"]]
+        return []
+    
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """获取歌单详情。"""
         data = await self._api_request(f"/playlist/detail?id={prov_playlist_id}")
@@ -650,36 +665,123 @@ class NCloudMusicProvider(MusicProvider):
             return self._parse_playlist(data["playlist"])
         raise ValueError(f"歌单不存在: {prov_playlist_id}")
     
+    async def get_artist_top_tracks(self, prov_artist_id: str) -> list[Track]:
+        """获取歌手热门 50 首歌曲。"""
+        data = await self._api_request(f"/artist/top/song?id={prov_artist_id}")
+        if data.get("code") != 200:
+            return []
+            
+        # 兼容不同的字段名
+        songs = data.get("songs") or data.get("hotSongs") or []
+        if songs:
+            return [self._parse_track(song) for song in songs]
+            
+        _LOGGER.warning("歌手热门歌曲为空或字段解析失败: %s", data.keys())
+        return []
+    
     # ========== 播放流 ==========
     
-    async def get_stream_details(self, item_id: str) -> StreamDetails:
+    async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """
         获取音频流详情。
         
-        调用 /song/url/v1 获取播放链接。
+        策略：官方优先 + 解灰兜底
+        1. 尝试官方源 (支持音质降级)
+        2. 如果是试听片段或无 URL，尝试解灰 (source=pyncmd,bodian,kuwo)
         """
-        # 获取播放 URL
-        data = await self._api_request(
-            "/song/url/v1",
-            {"id": item_id, "level": "exhigh"},
-        )
+        # 1. 尝试官方源
+        levels = ["exhigh", "standard", "higher", "jymaster"]
         
-        if data.get("code") != 200 or not data.get("data"):
-            raise ValueError(f"获取播放链接失败: {item_id}")
+        song_data = None
+        url = None
+        is_free_trial = False
         
-        song_data = data["data"][0]
-        url = song_data.get("url")
+        for level in levels:
+            data = await self._api_request(
+                "/song/url/v1",
+                {"id": item_id, "level": level},
+            )
+            
+            if data.get("code") == 200 and data.get("data"):
+                temp_data = data["data"][0]
+                temp_url = temp_data.get("url")
+                
+                # 检查是否为试听片段
+                if free_trial := temp_data.get("freeTrialInfo"):
+                    _LOGGER.warning("检测到试听片段 (level=%s): %s", level, free_trial)
+                    is_free_trial = True
+                    # 保存试听版数据作为兜底
+                    if not song_data:
+                        song_data = temp_data
+                        url = temp_url
+                    # 继续尝试更低音质，看是否有完整版
+                    continue
+                
+                # 获取到完整版 URL
+                if temp_url:
+                    _LOGGER.debug("获取官方完整版链接成功 (level=%s): %s", level, temp_url)
+                    song_data = temp_data
+                    url = temp_url
+                    is_free_trial = False
+                    break
         
+        # 2. 如果无 URL 或为试听片段，尝试解灰
+        if not url or is_free_trial:
+            _LOGGER.info("歌曲 %s 需要解灰（试听限制或无URL），尝试解灰源...", item_id)
+            try:
+                # 调用解灰接口
+                unblock_data = await self._api_request(
+                    "/song/url/match",
+                    {"id": item_id, "source": "pyncmd,bodian,kuwo"}
+                )
+                
+                if unblock_data.get("code") == 200 and unblock_data.get("data"):
+                    match_data = unblock_data["data"]
+                    match_url = match_data.get("url")
+                    
+                    if match_url:
+                        _LOGGER.info("🎉 解灰成功！使用解灰源 URL: %s", match_url)
+                        # 更新数据
+                        url = match_url
+                        # 构造一个模拟的 song_data，因为 match 接口返回结构可能不同
+                        # 优先使用 match 接口返回的元数据，缺失的用官方试听版的数据补全
+                        if not song_data:
+                            song_data = {}
+                        
+                        song_data["url"] = match_url
+                        song_data["br"] = match_data.get("br", song_data.get("br", 128000))
+                        song_data["type"] = match_data.get("type", song_data.get("type", "mp3"))
+                        song_data["size"] = match_data.get("size", song_data.get("size", 0))
+                        song_data["md5"] = match_data.get("md5", song_data.get("md5", ""))
+                        # 解灰成功后，不再视为试听
+                        is_free_trial = False
+                    else:
+                        _LOGGER.warning("解灰接口返回成功但 URL 为空")
+                else:
+                    _LOGGER.warning("解灰失败: %s", unblock_data)
+            except Exception as e:
+                _LOGGER.exception("解灰过程发生异常: %s", e)
+        
+        # 3. 最终检查
         if not url:
+            _LOGGER.warning("歌曲无可用播放链接 (解灰也失败): %s", item_id)
             raise ValueError(f"歌曲无可用播放链接: {item_id}")
+        
+        if is_free_trial:
+            _LOGGER.warning("最终只能播放试听片段: %s", item_id)
         
         # 解析音频格式
         content_type = ContentType.UNKNOWN
-        file_type = song_data.get("type", "").lower()
+        file_type = str(song_data.get("type", "")).lower()
+        bit_depth = 16
+        bit_rate = song_data.get("br", 0)  # bps
+        
         if file_type == "mp3":
             content_type = ContentType.MP3
         elif file_type == "flac":
             content_type = ContentType.FLAC
+            if bit_rate > 1000000:
+                bit_depth = 24
         elif file_type == "m4a":
             content_type = ContentType.AAC
         
@@ -689,35 +791,69 @@ class NCloudMusicProvider(MusicProvider):
             audio_format=AudioFormat(
                 content_type=content_type,
                 sample_rate=song_data.get("sr", 44100),
-                bit_depth=song_data.get("br", 320000) // 1000 if song_data.get("br") else 16,
+                bit_depth=bit_depth,
+                bit_rate=bit_rate // 1000 if bit_rate else None,  # kbps
             ),
             stream_type=StreamType.HTTP,
             path=url,
+            # 注意：解灰接口可能不返回 time，如果 song_data 是解灰构造的，可能缺 time
+            # 如果之前获取过官方试听版，song_data 中会有 time (试听版时长?)
+            # 最好还是用 Track 对象的 duration，但这里拿不到 Track 对象
+            # 暂时信任 song_data 中的 time，如果没有则为 None (MA 会自己处理)
+            duration=song_data.get("time", 0) // 1000 if song_data.get("time") else None,
         )
     
     # ========== 用户库 ==========
     
-    async def get_library_playlists(self) -> list[Playlist]:
+    async def get_library_playlists(self) -> AsyncGenerator[Playlist, None]:
         """获取用户收藏的歌单列表。"""
         # 获取用户信息
         user_data = await self._api_request("/user/account")
         if user_data.get("code") != 200 or not user_data.get("account"):
             _LOGGER.warning("未登录或获取用户信息失败")
-            return []
+            return
         
         uid = user_data["account"]["id"]
         
         # 获取用户歌单
         data = await self._api_request(f"/user/playlist?uid={uid}")
         if data.get("code") != 200 or not data.get("playlist"):
-            return []
+            return
         
-        return [self._parse_playlist(pl) for pl in data["playlist"]]
+        for pl in data["playlist"]:
+            yield self._parse_playlist(pl)
     
-    async def get_playlist_tracks(self, prov_playlist_id: str) -> list[Track]:
-        """获取歌单中的所有歌曲。"""
-        data = await self._api_request(f"/playlist/track/all?id={prov_playlist_id}")
-        if data.get("code") != 200 or not data.get("songs"):
-            return []
+    async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
+        """获取歌单中的所有歌曲（支持分页）。"""
+        # 限制每次获取的数量，模拟分页
+        limit = 50
+        offset = page * limit
         
-        return [self._parse_track(song) for song in data["songs"]]
+        # 注意：/playlist/track/all 接口实际上是一次性返回所有歌曲
+        # 为了符合 MA 的分页逻辑，我们需要在内存中切片
+        # 或者使用 /playlist/track/all?id={id}&limit={limit}&offset={offset} (如果支持)
+        # 经查，/playlist/track/all 支持 limit 和 offset
+        
+        data = await self._api_request(
+            "/playlist/track/all",
+            {"id": prov_playlist_id, "limit": limit, "offset": offset}
+        )
+        
+        if data.get("code") != 200 or not data.get("songs"):
+            # 尝试不带分页参数请求（兼容旧版或特定接口行为）
+            if page == 0:
+                data = await self._api_request(f"/playlist/track/all?id={prov_playlist_id}")
+            else:
+                return []
+        
+        songs = data.get("songs", [])
+        if not songs:
+            return []
+            
+        # 如果接口不支持分页返回了所有数据，我们需要手动切片
+        if len(songs) > limit:
+            start = page * limit
+            end = start + limit
+            songs = songs[start:end]
+            
+        return [self._parse_track(song) for song in songs]
