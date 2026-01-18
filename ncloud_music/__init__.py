@@ -31,6 +31,7 @@ from music_assistant_models.media_items import (
     AudioFormat,
     ItemMapping,
     MediaItemImage,
+    MediaItemMetadata,
     Playlist,
     ProviderMapping,
     SearchResults,
@@ -52,6 +53,8 @@ CONF_API_URL = "api_url"
 CONF_COOKIE = "cookie"
 CONF_ACTION_QR_LOGIN = "qr_login"
 CONF_AUDIO_QUALITY = "audio_quality"
+
+PLAYLIST_ID_DAILY = "daily_recommend"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -742,6 +745,36 @@ class NCloudMusicProvider(MusicProvider):
     
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """获取歌单详情。"""
+        if prov_playlist_id == PLAYLIST_ID_DAILY:
+            playlist = Playlist(
+                item_id=PLAYLIST_ID_DAILY,
+                provider=self.instance_id,
+                name="📅 每日推荐",
+                owner="云音乐",
+                provider_mappings={
+                    ProviderMapping(
+                        item_id=PLAYLIST_ID_DAILY,
+                        provider_domain=self.domain,
+                        provider_instance=self.instance_id,
+                    )
+                },
+            )
+            # 动态获取封面（使用第一首歌的封面）
+            try:
+                songs = await self._get_daily_recommend_songs()
+                if songs:
+                    # 找到第一首有封面的歌
+                    for song in songs:
+                        if song.metadata.images:
+                            if not playlist.metadata:
+                                playlist.metadata = MediaItemMetadata()
+                            playlist.metadata.images = song.metadata.images
+                            _LOGGER.debug("每日推荐封面已设置为: %s", song.name)
+                            break
+            except Exception as e:
+                _LOGGER.warning("获取每日推荐封面失败: %s", e)
+            return playlist
+
         data = await self._api_request(f"/playlist/detail?id={prov_playlist_id}")
         if data.get("code") == 200 and data.get("playlist"):
             return self._parse_playlist(data["playlist"])
@@ -915,11 +948,43 @@ class NCloudMusicProvider(MusicProvider):
         if data.get("code") != 200 or not data.get("playlist"):
             return
         
+        # 1. 插入虚拟的“每日推荐”歌单
+        daily_playlist = Playlist(
+            item_id=PLAYLIST_ID_DAILY,
+            provider=self.instance_id,
+            name="📅 每日推荐",
+            owner="云音乐",
+            provider_mappings={
+                ProviderMapping(
+                    item_id=PLAYLIST_ID_DAILY,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                )
+            },
+        )
+        # 动态获取封面
+        try:
+            songs = await self._get_daily_recommend_songs()
+            if songs:
+                for song in songs:
+                    if song.metadata.images:
+                        if not daily_playlist.metadata:
+                            daily_playlist.metadata = MediaItemMetadata()
+                        daily_playlist.metadata.images = song.metadata.images
+                        break
+        except Exception as e:
+            _LOGGER.warning("获取每日推荐封面失败: %s", e)
+            
+        yield daily_playlist
+
         for pl in data["playlist"]:
             yield self._parse_playlist(pl)
     
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """获取歌单中的所有歌曲（支持分页）。"""
+        if prov_playlist_id == PLAYLIST_ID_DAILY:
+            return await self._get_daily_recommend_songs(page)
+
         # 限制每次获取的数量，模拟分页
         limit = 50
         offset = page * limit
@@ -951,4 +1016,18 @@ class NCloudMusicProvider(MusicProvider):
             end = start + limit
             songs = songs[start:end]
             
+        return [self._parse_track(song) for song in songs]
+
+    async def _get_daily_recommend_songs(self, page: int = 0) -> list[Track]:
+        """获取每日推荐歌曲。"""
+        # 每日推荐通常只有 30 首左右，不支持分页，一次性返回
+        if page > 0:
+            return []
+            
+        data = await self._api_request("/recommend/songs")
+        if data.get("code") != 200:
+            _LOGGER.warning("获取每日推荐失败: %s", data)
+            return []
+            
+        songs = data.get("data", {}).get("dailySongs", [])
         return [self._parse_track(song) for song in songs]
