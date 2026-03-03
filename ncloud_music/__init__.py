@@ -55,6 +55,7 @@ CONF_API_URL = "api_url"
 CONF_COOKIE = "cookie"
 CONF_ACTION_QR_LOGIN = "qr_login"
 CONF_AUDIO_QUALITY = "audio_quality"
+CONF_IMAGE_SIZE = "image_size"
 
 PLAYLIST_ID_DAILY = "daily_recommend"
 
@@ -139,6 +140,21 @@ async def get_config_entries(
                 ConfigValueOption(title="超清母带 👑", value="jymaster"),
             ),
             description="播放时尝试的最高音质。如果所选音质不可用，将自动尝试更低音质。",
+        ),
+        ConfigEntry(
+            key=CONF_IMAGE_SIZE,
+            type=ConfigEntryType.STRING,
+            label="封面尺寸",
+            default_value="300",
+            options=(
+                ConfigValueOption(title="原图（最清晰，流量最大）", value="original"),
+                ConfigValueOption(title="120 x 120（最省流量）", value="120"),
+                ConfigValueOption(title="200 x 200（较省流量）", value="200"),
+                ConfigValueOption(title="300 x 300（默认）", value="300"),
+                ConfigValueOption(title="500 x 500（较清晰）", value="500"),
+                ConfigValueOption(title="800 x 800（高清）", value="800"),
+            ),
+            description="全局封面图片尺寸。尺寸越大越清晰，但加载越慢、流量越高。",
         ),
         ConfigEntry(
             key=CONF_COOKIE,
@@ -390,11 +406,13 @@ class NCloudMusicProvider(MusicProvider):
         self._api_url = str(self.config.get_value(CONF_API_URL)).rstrip("/")
         cookie_str = str(self.config.get_value(CONF_COOKIE) or "")
         self._cookies = self._parse_cookie(cookie_str)
+        self._image_size = str(self.config.get_value(CONF_IMAGE_SIZE) or "300")
         
         _LOGGER.info(
-            "NCloud Music Provider 初始化完成 (API: %s, 已登录: %s)",
+            "NCloud Music Provider 初始化完成 (API: %s, 已登录: %s, 封面尺寸: %s)",
             self._api_url,
             bool(self._cookies),
+            self._image_size,
         )
         # 轻量上下文标记：仅用于判断“最近是否来自歌单场景”。
         self._playlist_context_ids: deque[str] = deque(maxlen=1200)
@@ -631,7 +649,7 @@ class NCloudMusicProvider(MusicProvider):
                 track.metadata.images = [
                     MediaItemImage(
                         type=ImageType.THUMB,
-                        path=f"{pic_url}?param=300y300",
+                        path=self._build_image_url(pic_url),
                         provider=self.instance_id,
                     )
                 ]
@@ -671,7 +689,7 @@ class NCloudMusicProvider(MusicProvider):
             album.metadata.images = [
                 MediaItemImage(
                     type=ImageType.THUMB,
-                    path=f"{pic_url}?param=300y300",
+                    path=self._build_image_url(pic_url),
                     provider=self.instance_id,
                 )
             ]
@@ -700,7 +718,7 @@ class NCloudMusicProvider(MusicProvider):
             artist.metadata.images = [
                 MediaItemImage(
                     type=ImageType.THUMB,
-                    path=f"{pic_url}?param=300y300",
+                    path=self._build_image_url(pic_url),
                     provider=self.instance_id,
                 )
             ]
@@ -733,7 +751,7 @@ class NCloudMusicProvider(MusicProvider):
             playlist.metadata.images = [
                 MediaItemImage(
                     type=ImageType.THUMB,
-                    path=f"{pic_url}?param=300y300",
+                    path=self._build_image_url(pic_url),
                     provider=self.instance_id,
                 )
             ]
@@ -904,6 +922,14 @@ class NCloudMusicProvider(MusicProvider):
         if "dt" not in normalized and "duration" in normalized:
             normalized["dt"] = normalized["duration"]
         return normalized
+
+    def _build_image_url(self, image_url: str) -> str:
+        """根据全局配置构建封面图片 URL。"""
+        size = self._image_size
+        if not image_url or size == "original":
+            return image_url
+        separator = "&" if "?" in image_url else "?"
+        return f"{image_url}{separator}param={size}y{size}"
 
     async def _get_similar_song_tracks(self, prov_track_id: str) -> list[Track]:
         """主路径：通过当前歌曲获取相似歌曲。"""
