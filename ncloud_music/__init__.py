@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
-from collections.abc import AsyncGenerator
+from typing import TYPE_CHECKING, Any
+from collections.abc import AsyncGenerator, Sequence
 
 import aiohttp
 
@@ -29,6 +29,7 @@ from music_assistant_models.media_items import (
     Album,
     Artist,
     AudioFormat,
+    BrowseFolder,
     ItemMapping,
     MediaItemImage,
     MediaItemMetadata,
@@ -57,6 +58,16 @@ CONF_AUDIO_QUALITY = "audio_quality"
 PLAYLIST_ID_DAILY = "daily_recommend"
 
 _LOGGER = logging.getLogger(__name__)
+
+# 发现内容来源标签（用于补齐缺失的 creator 信息）
+DISCOVERY_OWNER_RECOMMEND = "云音乐推荐"
+DISCOVERY_OWNER_TOPLIST = "云音乐排行榜"
+DISCOVERY_OWNER_HQ = "云音乐精品歌单"
+BROWSE_CAT_MY = "my"
+BROWSE_CAT_DAILY = "daily"
+BROWSE_CAT_RECOMMEND = "recommend"
+BROWSE_CAT_TOPLIST = "toplist"
+BROWSE_CAT_HQ = "high_quality"
 
 
 async def setup(
@@ -370,6 +381,7 @@ class NCloudMusicProvider(MusicProvider):
             ProviderFeature.LIBRARY_PLAYLISTS,
             ProviderFeature.ARTIST_ALBUMS,
             ProviderFeature.ARTIST_TOPTRACKS,
+            ProviderFeature.SIMILAR_TRACKS,
         }
     
     async def handle_async_init(self) -> None:
@@ -383,6 +395,71 @@ class NCloudMusicProvider(MusicProvider):
             self._api_url,
             bool(self._cookies),
         )
+        # 用于 personal_fm 请求的去缓存扰动参数。
+        self._fm_request_seq = 0
+
+    async def browse(self, path: str) -> Sequence[Playlist | ItemMapping | BrowseFolder]:
+        """自定义浏览层级：在 playlists 下提供可见分类入口。"""
+        if "://" not in path:
+            return await super().browse(path)
+
+        # 只拦截 playlists 路径，其余沿用 MA 默认逻辑
+        path_parts = [part for part in path.split("://", 1)[1].split("/") if part]
+        if not path_parts or path_parts[0] != "playlists":
+            return await super().browse(path)
+
+        base_path = path if path.endswith("/") else f"{path}/"
+
+        # 一级：展示分类目录，而不是把所有歌单直接平铺
+        if len(path_parts) == 1:
+            return [
+                BrowseFolder(
+                    item_id=BROWSE_CAT_MY,
+                    provider=self.instance_id,
+                    path=f"{base_path}{BROWSE_CAT_MY}",
+                    name="我的歌单",
+                ),
+                BrowseFolder(
+                    item_id=BROWSE_CAT_DAILY,
+                    provider=self.instance_id,
+                    path=f"{base_path}{BROWSE_CAT_DAILY}",
+                    name="每日推荐",
+                ),
+                BrowseFolder(
+                    item_id=BROWSE_CAT_RECOMMEND,
+                    provider=self.instance_id,
+                    path=f"{base_path}{BROWSE_CAT_RECOMMEND}",
+                    name="推荐歌单",
+                ),
+                BrowseFolder(
+                    item_id=BROWSE_CAT_TOPLIST,
+                    provider=self.instance_id,
+                    path=f"{base_path}{BROWSE_CAT_TOPLIST}",
+                    name="排行榜",
+                ),
+                BrowseFolder(
+                    item_id=BROWSE_CAT_HQ,
+                    provider=self.instance_id,
+                    path=f"{base_path}{BROWSE_CAT_HQ}",
+                    name="精品歌单",
+                ),
+            ]
+
+        category = path_parts[1]
+        if category == BROWSE_CAT_MY:
+            return await self._get_user_playlists("my")
+        if category == BROWSE_CAT_DAILY:
+            daily_items: list[Playlist] = [await self._build_daily_playlist()]
+            daily_items.extend(await self._get_user_playlists("daily"))
+            return daily_items
+        if category == BROWSE_CAT_RECOMMEND:
+            return await self._get_discovery_playlists("recommend")
+        if category == BROWSE_CAT_TOPLIST:
+            return await self._get_discovery_playlists("toplist")
+        if category == BROWSE_CAT_HQ:
+            return await self._get_discovery_playlists("high_quality")
+
+        raise KeyError(f"Invalid playlists subpath: {category}")
     
     def _parse_cookie(self, cookie_str: str) -> dict[str, str]:
         """
@@ -648,6 +725,15 @@ class NCloudMusicProvider(MusicProvider):
             ]
         
         return playlist
+
+    def _normalize_playlist_data(self, data: dict, default_owner: str) -> dict:
+        """标准化不同接口返回的歌单字段。"""
+        normalized = dict(data)
+        if not normalized.get("coverImgUrl") and normalized.get("picUrl"):
+            normalized["coverImgUrl"] = normalized["picUrl"]
+        if not normalized.get("creator"):
+            normalized["creator"] = {"nickname": default_owner}
+        return normalized
     
     # ========== 获取详情 ==========
     
@@ -793,6 +879,77 @@ class NCloudMusicProvider(MusicProvider):
             
         _LOGGER.warning("歌手热门歌曲为空或字段解析失败: %s", data.keys())
         return []
+
+    def _normalize_track_payload(self, song: dict[str, Any]) -> dict[str, Any]:
+        """兼容不同接口的歌曲字段，统一为 _parse_track 可解析格式。"""
+        normalized = dict(song)
+        if "ar" not in normalized and "artists" in normalized:
+            normalized["ar"] = normalized["artists"]
+        if "al" not in normalized and "album" in normalized:
+            normalized["al"] = normalized["album"]
+        if "dt" not in normalized and "duration" in normalized:
+            normalized["dt"] = normalized["duration"]
+        return normalized
+
+    async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
+        """
+        获取动态推荐歌曲（供 MA Radio/DSTM 使用）。
+
+        实现策略：
+        - 通过 /personal_fm 分批取歌（每批通常 3 首）
+        - 每次请求附带 seq 参数，并由 _api_request 自动附加 timestamp，降低缓存复用概率
+        - 去重并过滤当前种子歌曲
+        """
+        target = max(1, min(limit, 100))
+        result: list[Track] = []
+        seen_ids: set[str] = {str(prov_track_id)}
+
+        # personal_fm 单次通常 3 首，按目标数量估算抓取次数并给额外余量
+        max_fetch_rounds = max(2, (target + 2) // 3 + 4)
+
+        for _ in range(max_fetch_rounds):
+            self._fm_request_seq += 1
+            data = await self._api_request(
+                "/personal_fm",
+                {
+                    "seq": self._fm_request_seq,
+                    "seed": str(prov_track_id),
+                },
+            )
+
+            if data.get("code") != 200:
+                _LOGGER.warning("获取 personal_fm 失败: code=%s", data.get("code"))
+                continue
+
+            songs = data.get("data") or data.get("songs") or []
+            if not songs:
+                continue
+
+            new_count = 0
+            for song in songs:
+                if not isinstance(song, dict) or "id" not in song:
+                    continue
+                item_id = str(song["id"])
+                if item_id in seen_ids:
+                    continue
+                seen_ids.add(item_id)
+
+                try:
+                    track = self._parse_track(self._normalize_track_payload(song))
+                except Exception as err:
+                    _LOGGER.debug("解析 personal_fm 歌曲失败: %s", err)
+                    continue
+
+                result.append(track)
+                new_count += 1
+                if len(result) >= target:
+                    return result
+
+            # 如果本轮没有新增，提前结束避免无意义请求
+            if new_count == 0:
+                break
+
+        return result
     
     # ========== 播放流 ==========
     
@@ -934,7 +1091,7 @@ class NCloudMusicProvider(MusicProvider):
     # ========== 用户库 ==========
     
     async def get_library_playlists(self) -> AsyncGenerator[Playlist, None]:
-        """获取用户收藏的歌单列表。"""
+        """获取歌单列表（用于库/列表视图，保持平铺聚合）。"""
         # 获取用户信息
         user_data = await self._api_request("/user/account")
         if user_data.get("code") != 200 or not user_data.get("account"):
@@ -945,10 +1102,35 @@ class NCloudMusicProvider(MusicProvider):
         
         # 获取用户歌单
         data = await self._api_request(f"/user/playlist?uid={uid}")
-        if data.get("code") != 200 or not data.get("playlist"):
-            return
+        user_playlists = data.get("playlist", []) if data.get("code") == 200 else []
+        if data.get("code") != 200:
+            _LOGGER.warning("获取用户歌单失败: code=%s", data.get("code"))
         
+        emitted_ids: set[str] = set()
+
         # 1. 插入虚拟的“每日推荐”歌单
+        daily_playlist = await self._build_daily_playlist()
+        emitted_ids.add(daily_playlist.item_id)
+        yield daily_playlist
+
+        # 2. 插入平台发现歌单（推荐/排行榜/精品）
+        discovery_playlists = await self._get_discovery_playlists("all")
+        for playlist in discovery_playlists:
+            if playlist.item_id in emitted_ids:
+                continue
+            emitted_ids.add(playlist.item_id)
+            yield playlist
+
+        # 3. 用户歌单
+        for pl in user_playlists:
+            playlist = self._parse_playlist(pl)
+            if playlist.item_id in emitted_ids:
+                continue
+            emitted_ids.add(playlist.item_id)
+            yield playlist
+
+    async def _build_daily_playlist(self) -> Playlist:
+        """构建虚拟每日推荐歌单。"""
         daily_playlist = Playlist(
             item_id=PLAYLIST_ID_DAILY,
             provider=self.instance_id,
@@ -962,7 +1144,6 @@ class NCloudMusicProvider(MusicProvider):
                 )
             },
         )
-        # 动态获取封面
         try:
             songs = await self._get_daily_recommend_songs()
             if songs:
@@ -974,11 +1155,88 @@ class NCloudMusicProvider(MusicProvider):
                         break
         except Exception as e:
             _LOGGER.warning("获取每日推荐封面失败: %s", e)
-            
-        yield daily_playlist
+        return daily_playlist
 
-        for pl in data["playlist"]:
-            yield self._parse_playlist(pl)
+    def _is_private_radar_playlist(self, playlist: Playlist) -> bool:
+        """判断是否为每日更新类的私人雷达歌单。"""
+        return "私人雷达" in (playlist.name or "")
+
+    async def _get_user_playlists(self, mode: str = "all") -> list[Playlist]:
+        """获取当前账号用户歌单，并按场景过滤。"""
+        user_data = await self._api_request("/user/account")
+        if user_data.get("code") != 200 or not user_data.get("account"):
+            _LOGGER.warning("未登录或获取用户信息失败")
+            return []
+        uid = user_data["account"]["id"]
+        data = await self._api_request(f"/user/playlist?uid={uid}")
+        if data.get("code") != 200:
+            _LOGGER.warning("获取用户歌单失败: code=%s", data.get("code"))
+            return []
+        playlists = data.get("playlist", [])
+        parsed_playlists = [self._parse_playlist(pl) for pl in playlists]
+
+        if mode == "daily":
+            return [pl for pl in parsed_playlists if self._is_private_radar_playlist(pl)]
+        if mode == "my":
+            return [pl for pl in parsed_playlists if not self._is_private_radar_playlist(pl)]
+        return parsed_playlists
+
+    async def _get_discovery_playlists(self, category: str = "all") -> list[Playlist]:
+        """获取平台发现内容中的歌单列表。"""
+        result: list[Playlist] = []
+        seen_ids: set[str] = set()
+
+        async def _append_playlists(items: list[dict], owner: str, limit: int) -> None:
+            count = 0
+            for item in items:
+                if count >= limit:
+                    break
+                try:
+                    playlist = self._parse_playlist(self._normalize_playlist_data(item, owner))
+                except Exception as err:
+                    _LOGGER.debug("解析发现歌单失败: %s", err)
+                    continue
+                if playlist.item_id in seen_ids:
+                    continue
+                seen_ids.add(playlist.item_id)
+                result.append(playlist)
+                count += 1
+
+        if category in ("all", "recommend"):
+            recommend_data = await self._api_request("/personalized", {"limit": 12})
+            recommend_items = (
+                recommend_data.get("result", []) if recommend_data.get("code") == 200 else []
+            )
+            _LOGGER.debug(
+                "发现歌单接口 /personalized: code=%s, count=%s",
+                recommend_data.get("code"),
+                len(recommend_items),
+            )
+            await _append_playlists(recommend_items, DISCOVERY_OWNER_RECOMMEND, 12)
+
+        if category in ("all", "toplist"):
+            toplist_data = await self._api_request("/toplist/detail")
+            toplist_items = toplist_data.get("list", []) if toplist_data.get("code") == 200 else []
+            _LOGGER.debug(
+                "发现歌单接口 /toplist/detail: code=%s, count=%s",
+                toplist_data.get("code"),
+                len(toplist_items),
+            )
+            await _append_playlists(toplist_items, DISCOVERY_OWNER_TOPLIST, 12)
+
+        if category in ("all", "high_quality"):
+            hq_data = await self._api_request("/top/playlist/highquality", {"limit": 12})
+            hq_items = hq_data.get("playlists", []) if hq_data.get("code") == 200 else []
+            _LOGGER.debug(
+                "发现歌单接口 /top/playlist/highquality: code=%s, count=%s",
+                hq_data.get("code"),
+                len(hq_items),
+            )
+            await _append_playlists(hq_items, DISCOVERY_OWNER_HQ, 12)
+
+        _LOGGER.debug("发现歌单最终合并数量: category=%s, count=%s", category, len(result))
+
+        return result
     
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """获取歌单中的所有歌曲（支持分页）。"""
