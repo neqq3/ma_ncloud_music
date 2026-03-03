@@ -1,4 +1,4 @@
-"""
+﻿"""
 NCloud Music Provider for Music Assistant.
 
 通过第三方 API 提供云音乐服务的 MA 原生插件。
@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
+from collections import deque
 from collections.abc import AsyncGenerator, Sequence
 
 import aiohttp
@@ -395,8 +396,21 @@ class NCloudMusicProvider(MusicProvider):
             self._api_url,
             bool(self._cookies),
         )
-        # 用于 personal_fm 请求的去缓存扰动参数。
-        self._fm_request_seq = 0
+        # 轻量上下文标记：仅用于判断“最近是否来自歌单场景”。
+        self._playlist_context_ids: deque[str] = deque(maxlen=1200)
+        self._playlist_context_set: set[str] = set()
+
+    def _remember_playlist_context(self, tracks: list[Track]) -> None:
+        """记录最近从歌单路径返回的歌曲 ID。"""
+        for track in tracks:
+            item_id = str(track.item_id)
+            if item_id in self._playlist_context_set:
+                continue
+            if len(self._playlist_context_ids) >= self._playlist_context_ids.maxlen:
+                dropped = self._playlist_context_ids.popleft()
+                self._playlist_context_set.discard(dropped)
+            self._playlist_context_ids.append(item_id)
+            self._playlist_context_set.add(item_id)
 
     async def browse(self, path: str) -> Sequence[Playlist | ItemMapping | BrowseFolder]:
         """自定义浏览层级：在 playlists 下提供可见分类入口。"""
@@ -891,68 +905,108 @@ class NCloudMusicProvider(MusicProvider):
             normalized["dt"] = normalized["duration"]
         return normalized
 
+    async def _get_similar_song_tracks(self, prov_track_id: str) -> list[Track]:
+        """主路径：通过当前歌曲获取相似歌曲。"""
+        data = await self._api_request("/simi/song", {"id": prov_track_id})
+        if data.get("code") != 200:
+            _LOGGER.warning("Failed to get similar songs: code=%s", data.get("code"))
+            return []
+
+        songs = data.get("songs") or []
+        result: list[Track] = []
+        for song in songs:
+            if not isinstance(song, dict) or "id" not in song:
+                continue
+            try:
+                result.append(self._parse_track(self._normalize_track_payload(song)))
+            except Exception as err:
+                _LOGGER.debug("Failed to parse similar song payload: %s", err)
+        return result
+
+    async def _get_similar_playlist_tracks(self, prov_track_id: str, limit: int) -> list[Track]:
+        """补量路径：只取一个相似歌单并抽取歌曲。"""
+        data = await self._api_request("/simi/playlist", {"id": prov_track_id})
+        if data.get("code") != 200:
+            return []
+
+        playlists = data.get("playlists") or []
+        playlist_id = ""
+        for playlist in playlists:
+            temp_id = str(playlist.get("id", ""))
+            if temp_id:
+                playlist_id = temp_id
+                break
+        if not playlist_id:
+            return []
+
+        target = max(1, min(limit, 50))
+        result: list[Track] = []
+        seen_ids: set[str] = set()
+
+        tracks_data = await self._api_request(
+            "/playlist/track/all",
+            {"id": playlist_id, "limit": target, "offset": 0},
+        )
+        songs = tracks_data.get("songs") or []
+        for song in songs:
+            if not isinstance(song, dict) or "id" not in song:
+                continue
+            item_id = str(song["id"])
+            if item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+            try:
+                result.append(self._parse_track(self._normalize_track_payload(song)))
+            except Exception as err:
+                _LOGGER.debug("Failed to parse track from similar playlist: %s", err)
+                continue
+            if len(result) >= target:
+                return result
+
+        return result
+
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
         """
-        获取动态推荐歌曲（供 MA Radio/DSTM 使用）。
+        为 MA 的 DSTM/Radio 提供下一批歌曲。
 
-        实现策略：
-        - 通过 /personal_fm 分批取歌（每批通常 3 首）
-        - 每次请求附带 seq 参数，并由 _api_request 自动附加 timestamp，降低缓存复用概率
-        - 去重并过滤当前种子歌曲
+        策略：
+        1) 如果命中最近歌单上下文：优先 /simi/playlist
+        2) 否则优先 /simi/song
+        3) 另一条路径用于补量
+        4) 不使用 /personal_fm，避免语义偏差
         """
         target = max(1, min(limit, 100))
+        seed_id = str(prov_track_id)
         result: list[Track] = []
-        seen_ids: set[str] = {str(prov_track_id)}
+        seen_ids: set[str] = {seed_id}
 
-        # personal_fm 单次通常 3 首，按目标数量估算抓取次数并给额外余量
-        max_fetch_rounds = max(2, (target + 2) // 3 + 4)
+        prefer_playlist = seed_id in self._playlist_context_set
+        if prefer_playlist:
+            primary_tracks = await self._get_similar_playlist_tracks(seed_id, target)
+            fallback_tracks = await self._get_similar_song_tracks(seed_id)
+        else:
+            primary_tracks = await self._get_similar_song_tracks(seed_id)
+            fallback_tracks = await self._get_similar_playlist_tracks(seed_id, target)
 
-        for _ in range(max_fetch_rounds):
-            self._fm_request_seq += 1
-            data = await self._api_request(
-                "/personal_fm",
-                {
-                    "seq": self._fm_request_seq,
-                    "seed": str(prov_track_id),
-                },
-            )
-
-            if data.get("code") != 200:
-                _LOGGER.warning("获取 personal_fm 失败: code=%s", data.get("code"))
+        for track in primary_tracks:
+            item_id = str(track.item_id)
+            if item_id in seen_ids:
                 continue
+            seen_ids.add(item_id)
+            result.append(track)
+            if len(result) >= target:
+                return result
 
-            songs = data.get("data") or data.get("songs") or []
-            if not songs:
+        for track in fallback_tracks:
+            item_id = str(track.item_id)
+            if item_id in seen_ids:
                 continue
-
-            new_count = 0
-            for song in songs:
-                if not isinstance(song, dict) or "id" not in song:
-                    continue
-                item_id = str(song["id"])
-                if item_id in seen_ids:
-                    continue
-                seen_ids.add(item_id)
-
-                try:
-                    track = self._parse_track(self._normalize_track_payload(song))
-                except Exception as err:
-                    _LOGGER.debug("解析 personal_fm 歌曲失败: %s", err)
-                    continue
-
-                result.append(track)
-                new_count += 1
-                if len(result) >= target:
-                    return result
-
-            # 如果本轮没有新增，提前结束避免无意义请求
-            if new_count == 0:
+            seen_ids.add(item_id)
+            result.append(track)
+            if len(result) >= target:
                 break
 
         return result
-    
-    # ========== 播放流 ==========
-    
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """
         获取音频流详情。
@@ -1273,8 +1327,10 @@ class NCloudMusicProvider(MusicProvider):
             start = page * limit
             end = start + limit
             songs = songs[start:end]
-            
-        return [self._parse_track(song) for song in songs]
+
+        tracks = [self._parse_track(song) for song in songs]
+        self._remember_playlist_context(tracks)
+        return tracks
 
     async def _get_daily_recommend_songs(self, page: int = 0) -> list[Track]:
         """获取每日推荐歌曲。"""
@@ -1289,3 +1345,4 @@ class NCloudMusicProvider(MusicProvider):
             
         songs = data.get("data", {}).get("dailySongs", [])
         return [self._parse_track(song) for song in songs]
+
