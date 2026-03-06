@@ -515,6 +515,13 @@ class NCloudMusicProvider(MusicProvider):
                 cookies[key] = value
         
         return cookies
+
+    def _safe_text(self, value: Any, default: str) -> str:
+        """Normalize text to a non-empty string to avoid None leaks."""
+        if value is None:
+            return default
+        value_str = str(value).strip()
+        return value_str or default
     
     async def _api_request(self, endpoint: str, params: dict | None = None) -> dict:
         """
@@ -611,7 +618,7 @@ class NCloudMusicProvider(MusicProvider):
         track = Track(
             item_id=track_id,
             provider=self.instance_id,
-            name=data.get("name", "未知歌曲"),
+            name=data.get("name") or "未知歌曲",
             provider_mappings={
                 ProviderMapping(
                     item_id=track_id,
@@ -622,27 +629,30 @@ class NCloudMusicProvider(MusicProvider):
         )
         
         # 后置设置属性
-        track.duration = data.get("dt", 0) // 1000
+        duration_ms = data.get("dt")
+        track.duration = int(duration_ms / 1000) if isinstance(duration_ms, (int, float)) and duration_ms > 0 else 0
         
         # 解析艺术家
         for ar in data.get("ar", []):
+            if not isinstance(ar, dict):
+                continue
             track.artists.append(
                 ItemMapping(
                     media_type=MediaType.ARTIST,
-                    item_id=str(ar["id"]),
+                    item_id=str(ar.get("id", 0)),
                     provider=self.instance_id,
-                    name=ar.get("name", "未知艺术家"),
+                    name=ar.get("name") or "未知艺术家",
                 )
             )
         
         # 解析专辑
         al = data.get("al", {})
-        if al:
+        if isinstance(al, dict) and al:
             track.album = ItemMapping(
                 media_type=MediaType.ALBUM,
                 item_id=str(al.get("id", 0)),
                 provider=self.instance_id,
-                name=al.get("name", "未知专辑"),
+                name=al.get("name") or "未知专辑",
             )
             # 使用专辑封面作为歌曲封面
             if pic_url := al.get("picUrl"):
@@ -663,7 +673,7 @@ class NCloudMusicProvider(MusicProvider):
         album = Album(
             item_id=album_id,
             provider=self.instance_id,
-            name=data.get("name", "未知专辑"),
+            name=data.get("name") or "未知专辑",
             provider_mappings={
                 ProviderMapping(
                     item_id=album_id,
@@ -675,12 +685,14 @@ class NCloudMusicProvider(MusicProvider):
         
         # 解析艺术家
         for ar in data.get("artists", []):
+            if not isinstance(ar, dict):
+                continue
             album.artists.append(
                 ItemMapping(
                     media_type=MediaType.ARTIST,
-                    item_id=str(ar["id"]),
+                    item_id=str(ar.get("id", 0)),
                     provider=self.instance_id,
-                    name=ar.get("name", "未知艺术家"),
+                    name=ar.get("name") or "未知艺术家",
                 )
             )
         
@@ -703,7 +715,7 @@ class NCloudMusicProvider(MusicProvider):
         artist = Artist(
             item_id=artist_id,
             provider=self.instance_id,
-            name=data.get("name", "未知艺术家"),
+            name=data.get("name") or "未知艺术家",
             provider_mappings={
                 ProviderMapping(
                     item_id=artist_id,
@@ -732,7 +744,7 @@ class NCloudMusicProvider(MusicProvider):
         playlist = Playlist(
             item_id=playlist_id,
             provider=self.instance_id,
-            name=data.get("name", "未知歌单"),
+            name=data.get("name") or "未知歌单",
             provider_mappings={
                 ProviderMapping(
                     item_id=playlist_id,
@@ -744,7 +756,7 @@ class NCloudMusicProvider(MusicProvider):
         
         # 创建者
         if creator := data.get("creator"):
-            playlist.owner = creator.get("nickname", "")
+            playlist.owner = self._safe_text(creator.get("nickname"), "")
         
         # 封面图片
         if pic_url := data.get("coverImgUrl"):
@@ -1354,7 +1366,44 @@ class NCloudMusicProvider(MusicProvider):
             end = start + limit
             songs = songs[start:end]
 
-        tracks = [self._parse_track(song) for song in songs]
+        tracks: list[Track] = []
+        skipped_count = 0
+        skipped_samples: list[dict[str, Any]] = []
+        for song in songs:
+            if not isinstance(song, dict):
+                skipped_count += 1
+                if len(skipped_samples) < 3:
+                    skipped_samples.append({"song_id": None, "error": "song is not a dict"})
+                continue
+            try:
+                tracks.append(self._parse_track(self._normalize_track_payload(song)))
+            except Exception as err:
+                skipped_count += 1
+                if len(skipped_samples) < 3:
+                    artists = song.get("ar") or song.get("artists") or []
+                    artist_names = []
+                    for artist in artists:
+                        if isinstance(artist, dict):
+                            artist_names.append(artist.get("name"))
+                    skipped_samples.append(
+                        {
+                            "song_id": song.get("id"),
+                            "name": song.get("name"),
+                            "artists": artist_names,
+                            "error": type(err).__name__,
+                        }
+                    )
+
+        if skipped_count:
+            _LOGGER.warning(
+                "Playlist parse skipped invalid songs: playlist_id=%s, page=%s, skipped=%s, returned=%s, samples=%s",
+                prov_playlist_id,
+                page,
+                skipped_count,
+                len(tracks),
+                skipped_samples,
+            )
+
         self._remember_playlist_context(tracks)
         return tracks
 
