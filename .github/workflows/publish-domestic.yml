@@ -1,0 +1,83 @@
+﻿name: Publish Domestic Mirror
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish_domestic:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check GitCode configuration
+        id: gitcode_check
+        run: |
+          if [ -n "$GITCODE_TOKEN" ] && [ -n "$TARGET_REPO" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "target_repo=$TARGET_REPO" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+          TARGET_REPO: ${{ secrets.GITCODE_REPO || github.repository }}
+
+      - name: Skip when GitCode is not configured
+        if: steps.gitcode_check.outputs.enabled != 'true'
+        run: |
+          echo "GitCode publish skipped."
+          echo "Please configure secrets.GITCODE_TOKEN and optionally secrets.GITCODE_REPO."
+
+      - name: Checkout upstream
+        if: steps.gitcode_check.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          path: upstream
+          fetch-depth: 0
+
+      - name: Sync and publish to GitCode
+        if: steps.gitcode_check.outputs.enabled == 'true'
+        env:
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+          GITCODE_REPO: ${{ steps.gitcode_check.outputs.target_repo }}
+        run: |
+          set -e
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          GITCODE_USER="$(echo "$GITCODE_REPO" | cut -d'/' -f1)"
+          GITCODE_URL="https://${GITCODE_USER}:${GITCODE_TOKEN}@gitcode.com/${GITCODE_REPO}.git"
+
+          git clone "$GITCODE_URL" domestic || {
+            echo "Clone failed or empty repository. Initializing repository..."
+            mkdir domestic
+            cd domestic
+            git init
+            git remote add origin "$GITCODE_URL"
+            cd ..
+          }
+
+          cd domestic
+          TARGET_BRANCH="$(git ls-remote --symref origin HEAD 2>/dev/null | awk '/^ref:/ {sub("refs/heads/","",$2); print $2; exit}')"
+          if [ -z "$TARGET_BRANCH" ]; then
+            TARGET_BRANCH="main"
+          fi
+          git checkout -B "$TARGET_BRANCH"
+          cd ..
+
+          rsync -av --exclude='.git' --delete upstream/ domestic/
+
+          cd domestic
+          git add .
+          if git diff --cached --quiet; then
+            echo "No changes needed for domestic repo."
+          else
+            git commit -m "chore: sync domestic mirror from ${{ github.sha }}"
+            git push origin "$TARGET_BRANCH" || git push -u origin "$TARGET_BRANCH"
+          fi
