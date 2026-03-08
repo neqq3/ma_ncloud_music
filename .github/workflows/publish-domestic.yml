@@ -34,50 +34,32 @@ jobs:
           echo "GitCode publish skipped."
           echo "Please configure secrets.GITCODE_TOKEN and optionally secrets.GITCODE_REPO."
 
-      - name: Checkout upstream
+      - name: Checkout upstream git history
         if: steps.gitcode_check.outputs.enabled == 'true'
         uses: actions/checkout@v4
         with:
-          path: upstream
           fetch-depth: 0
 
-      - name: Sync and publish to GitCode
+      - name: Push branch/tag to GitCode (preserve commit history)
         if: steps.gitcode_check.outputs.enabled == 'true'
         env:
           GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
           GITCODE_REPO: ${{ steps.gitcode_check.outputs.target_repo }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           set -e
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
           GITCODE_USER="$(echo "$GITCODE_REPO" | cut -d'/' -f1)"
           GITCODE_URL="https://${GITCODE_USER}:${GITCODE_TOKEN}@gitcode.com/${GITCODE_REPO}.git"
 
-          git clone "$GITCODE_URL" domestic || {
-            echo "Clone failed or empty repository. Initializing repository..."
-            mkdir domestic
-            cd domestic
-            git init
-            git remote add origin "$GITCODE_URL"
-            cd ..
-          }
+          git remote remove domestic 2>/dev/null || true
+          git remote add domestic "$GITCODE_URL"
 
-          cd domestic
-          TARGET_BRANCH="$(git ls-remote --symref origin HEAD 2>/dev/null | awk '/^ref:/ {sub("refs/heads/","",$2); print $2; exit}')"
-          if [ -z "$TARGET_BRANCH" ]; then
-            TARGET_BRANCH="main"
-          fi
-          git checkout -B "$TARGET_BRANCH"
-          cd ..
-
-          rsync -av --exclude='.git' --delete upstream/ domestic/
-
-          cd domestic
-          git add .
-          if git diff --cached --quiet; then
-            echo "No changes needed for domestic repo."
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "Syncing tag: $GITHUB_REF_NAME"
+            git push domestic "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME" --force
           else
-            git commit -m "chore: sync domestic mirror from ${{ github.sha }}"
-            git push origin "$TARGET_BRANCH" || git push -u origin "$TARGET_BRANCH"
+            echo "Syncing branch: $GITHUB_REF_NAME"
+            git push domestic "HEAD:refs/heads/$GITHUB_REF_NAME" --force
           fi
