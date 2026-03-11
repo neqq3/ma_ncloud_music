@@ -1,4 +1,4 @@
-﻿"""
+"""
 NCloud Music Provider for Music Assistant.
 
 通过第三方 API 提供云音乐服务的 MA 原生插件。
@@ -636,24 +636,21 @@ class NCloudMusicProvider(MusicProvider):
         for ar in data.get("ar", []):
             if not isinstance(ar, dict):
                 continue
+            artist_id = self._get_valid_item_id(ar.get("id"))
+            if artist_id is None:
+                continue
             track.artists.append(
                 ItemMapping(
                     media_type=MediaType.ARTIST,
-                    item_id=str(ar.get("id", 0)),
+                    item_id=artist_id,
                     provider=self.instance_id,
                     name=ar.get("name") or "未知艺术家",
                 )
             )
-        
+
         # 解析专辑
         al = data.get("al", {})
         if isinstance(al, dict) and al:
-            track.album = ItemMapping(
-                media_type=MediaType.ALBUM,
-                item_id=str(al.get("id", 0)),
-                provider=self.instance_id,
-                name=al.get("name") or "未知专辑",
-            )
             # 使用专辑封面作为歌曲封面
             if pic_url := al.get("picUrl"):
                 track.metadata.images = [
@@ -663,7 +660,21 @@ class NCloudMusicProvider(MusicProvider):
                         provider=self.instance_id,
                     )
                 ]
-        
+            album_id = self._get_valid_item_id(al.get("id"))
+            if album_id is not None:
+                track.album = ItemMapping(
+                    media_type=MediaType.ALBUM,
+                    item_id=album_id,
+                    provider=self.instance_id,
+                    name=al.get("name") or "未知专辑",
+                )
+            else:
+                _LOGGER.debug(
+                    "跳过无效专辑引用: track_id=%s album=%s",
+                    track_id,
+                    {"id": al.get("id"), "name": al.get("name")},
+                )
+
         return track
     
     def _parse_album(self, data: dict) -> Album:
@@ -934,6 +945,15 @@ class NCloudMusicProvider(MusicProvider):
         if "dt" not in normalized and "duration" in normalized:
             normalized["dt"] = normalized["duration"]
         return normalized
+
+    def _get_valid_item_id(self, value: Any) -> str | None:
+        """返回合法的 provider item_id；占位值统一视为无效。"""
+        if value is None:
+            return None
+        item_id = str(value).strip()
+        if item_id in {"", "0", "None", "none", "null", "NULL"}:
+            return None
+        return item_id
 
     def _build_image_url(self, image_url: str) -> str:
         """根据全局配置构建封面图片 URL。"""
@@ -1420,4 +1440,3 @@ class NCloudMusicProvider(MusicProvider):
             
         songs = data.get("data", {}).get("dailySongs", [])
         return [self._parse_track(song) for song in songs]
-
