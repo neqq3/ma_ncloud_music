@@ -26,6 +26,7 @@ from music_assistant_models.enums import (
     ProviderFeature,
     StreamType,
 )
+from music_assistant_models.errors import MediaNotFoundError
 from music_assistant_models.media_items import (
     Album,
     Artist,
@@ -1162,7 +1163,7 @@ class NCloudMusicProvider(MusicProvider):
         # 3. 最终检查
         if not url:
             _LOGGER.warning("歌曲无可用播放链接 (解灰也失败): %s", item_id)
-            raise ValueError(f"歌曲无可用播放链接: {item_id}")
+            raise MediaNotFoundError(f"歌曲无可用播放链接: {item_id}")
         
         if is_free_trial:
             _LOGGER.warning("最终只能播放试听片段: %s", item_id)
