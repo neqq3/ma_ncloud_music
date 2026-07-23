@@ -56,6 +56,7 @@ CONF_API_URL = "api_url"
 CONF_COOKIE = "cookie"
 CONF_ACTION_QR_LOGIN = "qr_login"
 CONF_AUDIO_QUALITY = "audio_quality"
+CONF_PLAY_FREE_TRIAL = "play_free_trial"
 CONF_IMAGE_SIZE = "image_size"
 
 PLAYLIST_ID_DAILY = "daily_recommend"
@@ -141,6 +142,16 @@ async def get_config_entries(
                 ConfigValueOption(title="超清母带 👑", value="jymaster"),
             ),
             description="播放时尝试的最高音质。如果所选音质不可用，将自动尝试更低音质。",
+        ),
+        ConfigEntry(
+            key=CONF_PLAY_FREE_TRIAL,
+            type=ConfigEntryType.BOOLEAN,
+            label="仅有试听片段时继续播放",
+            description=(
+                "仅能获取试听片段时继续播放。关闭后将跳过该歌曲；"
+                "默认开启，以避免免费账号连续跳过大量歌曲。"
+            ),
+            default_value=True,
         ),
         ConfigEntry(
             key=CONF_IMAGE_SIZE,
@@ -1107,8 +1118,8 @@ class NCloudMusicProvider(MusicProvider):
                 if free_trial := temp_data.get("freeTrialInfo"):
                     _LOGGER.warning("检测到试听片段 (level=%s): %s", level, free_trial)
                     is_free_trial = True
-                    # 保存试听版数据作为兜底
-                    if not song_data:
+                    # 保存首个可播放的试听版数据作为兜底
+                    if temp_url and not url:
                         song_data = temp_data
                         url = temp_url
                     # 继续尝试更低音质，看是否有完整版
@@ -1127,6 +1138,10 @@ class NCloudMusicProvider(MusicProvider):
             raise MediaNotFoundError(f"歌曲无可用播放链接: {item_id}")
         
         if is_free_trial:
+            # 新增配置在旧实例中可能暂时没有持久化值；缺失时按默认开启处理。
+            if self.config.get_value(CONF_PLAY_FREE_TRIAL) is False:
+                _LOGGER.warning("歌曲仅有试听片段，已按配置跳过: %s", item_id)
+                raise MediaNotFoundError(f"歌曲仅有试听片段，已按配置跳过: {item_id}")
             _LOGGER.warning("最终只能播放试听片段: %s", item_id)
         
         # 解析音频格式
