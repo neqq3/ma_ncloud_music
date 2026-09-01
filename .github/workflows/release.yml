@@ -161,9 +161,9 @@ jobs:
           fi
 
           if [ "$PRERELEASE" = "true" ]; then
-            RELEASE_STATUS="pre"
+            export RELEASE_STATUS="pre"
           else
-            RELEASE_STATUS="latest"
+            export RELEASE_STATUS="latest"
           fi
 
           python3 - <<'PY'
@@ -198,13 +198,3 @@ jobs:
           fi
 
           echo "GitCode release $TAG synced successfully."
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
-          GITCODE_REPO: ${{ secrets.GITCODE_REPO || github.repository }}
-          TAG: ${{ steps.release.outputs.tag }}
-          TITLE: ${{ steps.release.outputs.title }}
-          PRERELEASE: ${{ steps.release.outputs.prerelease }}
-          HAS_FILE: ${{ steps.release.outputs.has_file }}
-          NOTES_FILE: ${{ steps.release.outputs.file }}
-          RELEASE_STATUS: ${{ steps.release.outputs.prerelease == 'true' && 'pre' || 'latest' }}
