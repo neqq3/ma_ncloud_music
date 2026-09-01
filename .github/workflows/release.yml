@@ -93,3 +93,30 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: ${{ steps.release.outputs.prerelease }}
+
+      - name: Sync Release Tag To GitCode
+        env:
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+          GITCODE_REPO: ${{ secrets.GITCODE_REPO || github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -e
+
+          if [ -z "$GITCODE_TOKEN" ] || [ -z "$GITCODE_REPO" ]; then
+            echo "GitCode tag sync skipped: missing GITCODE_TOKEN or GITCODE_REPO."
+            exit 0
+          fi
+
+          # Ensure the tag exists locally even when the Release was created by a previous workflow run.
+          git fetch --tags origin
+          if ! git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG does not exist on GitHub."
+            exit 1
+          fi
+
+          GITCODE_USER="$(echo "$GITCODE_REPO" | cut -d'/' -f1)"
+          GITCODE_URL="https://${GITCODE_USER}:${GITCODE_TOKEN}@gitcode.com/${GITCODE_REPO}.git"
+
+          git remote remove domestic 2>/dev/null || true
+          git remote add domestic "$GITCODE_URL"
+          git push domestic "refs/tags/$TAG:refs/tags/$TAG" --force
