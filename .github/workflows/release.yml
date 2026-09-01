@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "*"
+    paths:
+      - "ncloud_music/manifest.json"
+      - "docs/releases/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve Release
+        id: release
+        shell: bash
+        run: |
+          set -e
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="$(python3 - <<'PY'
+          import json
+          with open('ncloud_music/manifest.json', encoding='utf-8') as f:
+              print(json.load(f)['version'])
+          PY
+          )"
+          fi
+
+          if [[ "$TAG" == *"-beta"* || "$TAG" == *"-alpha"* || "$TAG" == *"-rc"* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          FILE="docs/releases/${TAG}.md"
+          if [ -f "$FILE" ]; then
+            TITLE="$(head -n 1 "$FILE" | sed -E 's/^#[[:space:]]*//')"
+            [ -n "$TITLE" ] || TITLE="$TAG"
+            echo "has_file=true" >> "$GITHUB_OUTPUT"
+            echo "file=$FILE" >> "$GITHUB_OUTPUT"
+            echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_file=false" >> "$GITHUB_OUTPUT"
+            echo "title=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check Existing Release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.release.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Release From File
+        if: steps.existing.outputs.exists != 'true' && steps.release.outputs.has_file == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: ${{ steps.release.outputs.title }}
+          body_path: ${{ steps.release.outputs.file }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: ${{ steps.release.outputs.prerelease }}
+
+      - name: Create Release With Auto Notes
+        if: steps.existing.outputs.exists != 'true' && steps.release.outputs.has_file != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: ${{ steps.release.outputs.title }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ steps.release.outputs.prerelease }}

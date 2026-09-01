@@ -1,9 +1,14 @@
 # MA NCloud Music
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Music Assistant](https://img.shields.io/badge/Music%20Assistant-2.x-brightgreen.svg)
+![Music Assistant](https://img.shields.io/badge/Music%20Assistant-2.7.x%20%E2%86%92%20latest-brightgreen.svg)
 
 **MA NCloud Music** 是为 **[Music Assistant](https://github.com/music-assistant/hass-music-assistant)** 编写的云音乐第三方 Provider 插件。通过 `NeteaseCloudMusicApi-Enhanced` 接口提供支持，允许在您的智能家居系统中播放云音乐的曲库内容。
+
+## 兼容性
+
+- 设计支持：**Music Assistant 2.7.x 至当前最新版本（目前为 2.10.x）**。
+- 如需兼容更早的 Music Assistant 版本，欢迎提交 Issue。
 
 ---
 
@@ -64,7 +69,7 @@
 ## 部署与安装
 
 ### 1. 前置依赖
-- 运行中的 [Music Assistant](https://github.com/music-assistant/hass-music-assistant) (2.x 稳定版本)
+- 运行中的 [Music Assistant](https://github.com/music-assistant/hass-music-assistant)（2.7.x 至当前最新版本）
 - 已部署并可访问的 `NeteaseCloudMusicApi-Enhanced` 服务端点
 
 ### 2. 挂载安装 (以 Docker 为例)

@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models.music_provider import MusicProvider
 
-__version__ = "0.2.0-beta.2"
+__version__ = "0.4.0"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -139,7 +139,7 @@ class NCloudMusicProvider(LegacyNCloudMusicProvider):
         )
 
         _LOGGER.info(
-            "NCloud Music Provider 初始化完成 (MA 2.9/2.10 unified, API: %s, 已登录: %s, 封面尺寸: %s)",
+            "NCloud Music Provider 初始化完成 (MA 2.9/2.10 compatible, API: %s, 已登录: %s, 封面尺寸: %s)",
             self._api_url or "<未配置>",
             bool(self._cookies),
             self._image_size,
