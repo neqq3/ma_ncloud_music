@@ -67,6 +67,12 @@ class NCloudMusicProvider(LegacyNCloudMusicProvider):
 
         return default
 
+    async def get_stream_details(self, item_id: str, media_type: Any):
+        """Return stream details and explicitly allow seeking on normal HTTP tracks."""
+        streamdetails = await super().get_stream_details(item_id, media_type)
+        streamdetails.allow_seek = True
+        return streamdetails
+
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return runtime-editable options for an already configured provider."""
         has_cookie = bool(self._get_setup_or_config_value(CONF_COOKIE, ""))

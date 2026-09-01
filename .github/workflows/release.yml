@@ -72,6 +72,22 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Refresh Existing Release Hotfix
+        if: steps.existing.outputs.exists == 'true' && github.ref_type == 'branch' && contains(github.event.head_commit.message, '[retag]')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          TITLE: ${{ steps.release.outputs.title }}
+          HAS_FILE: ${{ steps.release.outputs.has_file }}
+          NOTES_FILE: ${{ steps.release.outputs.file }}
+        run: |
+          set -e
+          git tag -f "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG:refs/tags/$TAG" --force
+          if [ "$HAS_FILE" = "true" ] && [ -f "$NOTES_FILE" ]; then
+            gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE"
+          fi
+
       - name: Create Release From File
         if: steps.existing.outputs.exists != 'true' && steps.release.outputs.has_file == 'true'
         uses: softprops/action-gh-release@v2
@@ -107,7 +123,7 @@ jobs:
             exit 0
           fi
 
-          git fetch --tags origin
+          git fetch --tags origin --force
           if ! git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
             echo "Tag $TAG does not exist on GitHub."
             exit 1
