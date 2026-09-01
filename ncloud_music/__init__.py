@@ -1,9 +1,9 @@
-"""Music Assistant 2.10 compatibility entrypoint for NCloud Music."""
+"""Music Assistant 2.9/2.10 compatibility entrypoint for NCloud Music."""
 from __future__ import annotations
 
 import logging
 from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import ConfigEntryType
@@ -24,16 +24,52 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models.music_provider import MusicProvider
 
-__version__ = "0.2.0-beta.1"
+__version__ = "0.2.0-beta.2"
 _LOGGER = logging.getLogger(__name__)
 
 
 class NCloudMusicProvider(LegacyNCloudMusicProvider):
-    """NCloud provider adapted to Music Assistant 2.10 setup/options APIs."""
+    """NCloud provider with small compatibility shims for MA 2.9 and 2.10."""
+
+    def _get_setup_or_config_value(self, key: str, default: Any = "") -> Any:
+        """Read setup_data on MA 2.10, falling back to legacy ProviderConfig on MA 2.9."""
+        get_setup_value = getattr(self, "get_setup_value", None)
+        if callable(get_setup_value):
+            value = get_setup_value(key, None)
+            if value is not None:
+                return value
+
+        config = getattr(self, "config", None)
+        if config is not None:
+            get_value = getattr(config, "get_value", None)
+            if callable(get_value):
+                value = get_value(key)
+                if value is not None:
+                    return value
+
+        return default
+
+    def _get_runtime_config_value(self, key: str, default: Any = "") -> Any:
+        """Read runtime options using the API available on the running MA version."""
+        get_config_value = getattr(self, "get_config_value", None)
+        if callable(get_config_value):
+            value = get_config_value(key, None)
+            if value is not None:
+                return value
+
+        config = getattr(self, "config", None)
+        if config is not None:
+            get_value = getattr(config, "get_value", None)
+            if callable(get_value):
+                value = get_value(key)
+                if value is not None:
+                    return value
+
+        return default
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return runtime-editable options for an already configured provider."""
-        has_cookie = bool(self.get_setup_value(CONF_COOKIE, ""))
+        has_cookie = bool(self._get_setup_or_config_value(CONF_COOKIE, ""))
         return (
             ConfigEntry(
                 key=CONF_AUDIO_QUALITY,
@@ -92,14 +128,18 @@ class NCloudMusicProvider(LegacyNCloudMusicProvider):
         )
 
     async def handle_async_init(self) -> None:
-        """Initialize with credentials collected by the MA 2.10 setup flow."""
-        self._api_url = str(self.get_setup_value(CONF_API_URL, "") or "").rstrip("/")
-        cookie_str = str(self.get_setup_value(CONF_COOKIE, "") or "")
+        """Initialize from MA 2.10 setup_data or the MA 2.9 legacy config store."""
+        self._api_url = str(
+            self._get_setup_or_config_value(CONF_API_URL, "") or ""
+        ).rstrip("/")
+        cookie_str = str(self._get_setup_or_config_value(CONF_COOKIE, "") or "")
         self._cookies = self._parse_cookie(cookie_str)
-        self._image_size = str(self.get_config_value(CONF_IMAGE_SIZE, "300") or "300")
+        self._image_size = str(
+            self._get_runtime_config_value(CONF_IMAGE_SIZE, "300") or "300"
+        )
 
         _LOGGER.info(
-            "NCloud Music Provider 初始化完成 (MA 2.10 compat, API: %s, 已登录: %s, 封面尺寸: %s)",
+            "NCloud Music Provider 初始化完成 (MA 2.9/2.10 unified, API: %s, 已登录: %s, 封面尺寸: %s)",
             self._api_url or "<未配置>",
             bool(self._cookies),
             self._image_size,
@@ -113,5 +153,5 @@ async def setup(
     manifest: ProviderManifest,
     config: ProviderConfig,
 ) -> MusicProvider:
-    """Initialize the MA 2.10 compatible provider instance."""
+    """Initialize the unified MA 2.9/2.10 compatible provider instance."""
     return NCloudMusicProvider(mass, manifest, config)
